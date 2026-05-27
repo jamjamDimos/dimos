@@ -32,6 +32,7 @@ from dimos.navigation.patrolling.module import PatrollingModule
 from dimos.navigation.replanning_a_star.module import ReplanningAStarPlanner
 from dimos.perception.fiducial.marker_tf_module import MarkerTfModule
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import unitree_go2_basic
+from dimos.robot.unitree.go2.connection import GO2Connection
 
 unitree_go2 = autoconnect(
     unitree_go2_basic,
@@ -42,6 +43,11 @@ unitree_go2 = autoconnect(
     PatrollingModule.blueprint(),
     MovementManager.blueprint(),
 ).global_config(n_workers=10, robot_model="unitree_go2")
+
+unitree_go2_rage = autoconnect(
+    unitree_go2,
+    GO2Connection.blueprint(mode="rage"),
+).global_config(obstacle_avoidance=True)
 
 
 class Go2MemoryConfig(RecorderConfig):
