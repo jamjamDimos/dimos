@@ -9,13 +9,16 @@ from dimos.core.transport import LCMTransport
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.vision_msgs.Detection2DArray import Detection2DArray
 from dimos.navigation.movement_manager.movement_manager import MovementManager
-from dimos.robot.custom.tasks.bbox_distance_behavior_module import BBoxDistanceBehaviorModule
+from dimos.navigation.replanning_a_star.module import ReplanningAStarPlanner
 from dimos.robot.custom.modules.bbox_selection_module import BBoxSelectionModule
-from dimos.robot.custom.modules.target_lock_module import TargetLockModule
+from dimos.robot.custom.modules.selected_bbox_csrt_tracker_module import (
+    SelectedBBoxCsrtTrackerModule,
+)
 from dimos.robot.custom.modules.yoloe_tracking_module import (
     YoloeTrackingModule,
     _require_yoloe_lrpc_model,
 )
+from dimos.robot.custom.tasks.bbox_distance_behavior_module import BBoxDistanceBehaviorModule
 from dimos.robot.custom.visualization.detection2d_overlay import (
     selected_bbox_overlay,
     yoloe_overlay,
@@ -29,16 +32,16 @@ from dimos.visualization.vis_module import vis_module
 
 _YOLOE_DETECTIONS_TOPIC = "/color_image/yoloe_detections"
 _USER_SELECTED_BBOX_TOPIC = "/color_image/selected_bbox"
-_LOCKED_BBOX_TOPIC = "/color_image/locked_bbox"
+_TRACKED_BBOX_TOPIC = "/color_image/tracked_bbox"
 _NAV_CMD_VEL_TOPIC = "/nav_cmd_vel"
 _TELE_CMD_VEL_TOPIC = "/tele_cmd_vel"
 
 _YOLOE_DETECTIONS_ENTITY = "world/color_image/yoloe_detections"
 _USER_SELECTED_BBOX_ENTITY = "world/color_image/selected_bbox"
-_LOCKED_BBOX_ENTITY = "world/color_image/locked_bbox"
+_TRACKED_BBOX_ENTITY = "world/color_image/tracked_bbox"
 
 
-def _target_lock_rerun_blueprint() -> Any:
+def _csrt_tracker_rerun_blueprint() -> Any:
     import rerun as rr
     import rerun.blueprint as rrb
 
@@ -55,7 +58,7 @@ def _target_lock_rerun_blueprint() -> Any:
                     "world/**",
                     f"-{_YOLOE_DETECTIONS_ENTITY}",
                     f"-{_USER_SELECTED_BBOX_ENTITY}",
-                    f"-{_LOCKED_BBOX_ENTITY}",
+                    f"-{_TRACKED_BBOX_ENTITY}",
                 ],
                 name="3D",
                 background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
@@ -70,39 +73,50 @@ def _target_lock_rerun_blueprint() -> Any:
     )
 
 
-_target_lock_rerun_config = {
+_csrt_tracker_rerun_config = {
     **go2_rerun_config,
-    "blueprint": _target_lock_rerun_blueprint,
+    "blueprint": _csrt_tracker_rerun_blueprint,
     "visual_override": {
         **go2_rerun_config["visual_override"],
         _YOLOE_DETECTIONS_ENTITY: yoloe_overlay,
         _USER_SELECTED_BBOX_ENTITY: selected_bbox_overlay,
-        _LOCKED_BBOX_ENTITY: selected_bbox_overlay,
+        _TRACKED_BBOX_ENTITY: selected_bbox_overlay,
     },
 }
 
-_target_lock_vis = vis_module(
+_csrt_tracker_vis = vis_module(
     viewer_backend=global_config.viewer,
-    rerun_config=_target_lock_rerun_config,
+    rerun_config=_csrt_tracker_rerun_config,
 )
 
 
 yoloe_target_lock_distance_follow = (
     autoconnect(
         unitree_go2,
-        _target_lock_vis,
+        _csrt_tracker_vis,
         YoloeTrackingModule.blueprint(),
         BBoxSelectionModule.blueprint(),
-        TargetLockModule.blueprint(),
-        BBoxDistanceBehaviorModule.blueprint(),
+        SelectedBBoxCsrtTrackerModule.blueprint(
+            tracking_hz=10.0,
+            max_lost_frames=15,
+            reacquire_max_center_jump_px=200.0,
+            action_log_interval_sec=1.0,
+            tracker_backend="template",
+        ),
+        BBoxDistanceBehaviorModule.blueprint(
+            near_distance=0.5,
+            dwell_duration_sec=10.0,
+            standoff_distance=1.5,
+            standoff_duration_sec=45.0,
+        ),
         # Keyboard teleop: publishes tele_cmd_vel when keys held; silent otherwise.
         # MovementManager (from unitree_go2) muxes tele_cmd_vel (priority) + nav_cmd_vel
         # (task) → cmd_vel.
         # MovementManager emits stop_movement for keyboard/map control. The bbox
-        # selection + target lock modules consume that signal and clear the active
-        # target so the old bbox cannot restart the one-shot task on the next frame.
+        # selection + CSRT tracker modules consume that signal and clear the active
+        # target so the old bbox cannot restart the sequence on the next frame.
         # BBoxDistanceBehaviorModule also emits clear_selection_request when the
-        # one-shot task completes or is stopped by RPC.
+        # full approach/dwell/standoff/return sequence completes or is stopped by RPC.
         KeyboardTeleop.blueprint(publish_only_when_active=True),
     )
     .global_config(
@@ -112,8 +126,12 @@ yoloe_target_lock_distance_follow = (
     .remappings(
         [
             (BBoxSelectionModule, "selected_bbox", "user_selected_bbox"),
-            (TargetLockModule, "selected_bbox", "user_selected_bbox"),
-            (TargetLockModule, "locked_bbox", "selected_bbox"),
+            (BBoxDistanceBehaviorModule, "selected_bbox", "tracked_bbox"),
+            (BBoxDistanceBehaviorModule, "lock_status", "tracking_status"),
+            # Camera-view clicks select YOLOE bbox. Keep A* from consuming those
+            # same clicked_point events as navigation goals.
+            (ReplanningAStarPlanner, "clicked_point", "navigation_clicked_point"),
+            (MovementManager, "clicked_point", "navigation_clicked_point"),
             # Task cmd_vel → MovementManager nav_cmd_vel (lower priority than keyboard)
             (BBoxDistanceBehaviorModule, "cmd_vel", "nav_cmd_vel"),
             # Keyboard cmd_vel → MovementManager tele_cmd_vel (higher priority)
@@ -132,8 +150,8 @@ yoloe_target_lock_distance_follow = (
                 _USER_SELECTED_BBOX_TOPIC,
                 Detection2DArray,
             ),
-            ("locked_bbox", Detection2DArray): LCMTransport(
-                _LOCKED_BBOX_TOPIC,
+            ("tracked_bbox", Detection2DArray): LCMTransport(
+                _TRACKED_BBOX_TOPIC,
                 Detection2DArray,
             ),
             ("nav_cmd_vel", Twist): LCMTransport(

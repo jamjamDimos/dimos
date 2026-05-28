@@ -31,8 +31,8 @@ Usage:
 Keyboard controls (pygame window must have focus):
     W / S       — forward / backward
     A / D       — rotate left / right
-    Shift       — speed boost  (2×)
-    Ctrl        — slow mode    (0.5×)
+    Shift       — speed boost  (2x)
+    Ctrl        — slow mode    (0.5x)
     Space       — publish zero Twist (stop)
     Esc / Q     — quit keyboard window
 """

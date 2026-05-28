@@ -3,6 +3,7 @@ from __future__ import annotations  # 允许类型注解延迟解析，减少循
 import json  # 导入 JSON 工具，用于发布结构化行为状态
 import math  # 导入数学工具，用于检查有限数值
 import threading  # 导入线程工具，用后台循环发布速度命令
+import time  # 导入单调时钟工具，用于 dwell / standoff 阶段计时
 from typing import Any, Literal  # 导入通用类型和状态字面量类型
 
 from dimos_lcm.sensor_msgs import (
@@ -15,6 +16,7 @@ from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT  # 导入线程停止等
 from dimos.core.core import rpc  # 导入 rpc 装饰器，让方法可通过 DimOS RPC 调用
 from dimos.core.module import Module, ModuleConfig  # 导入模块基类和模块配置基类
 from dimos.core.stream import In, Out  # 导入输入输出流类型
+from dimos.msgs.geometry_msgs.Transform import Transform  # 导入 TF 变换类型，用于距离估计
 from dimos.msgs.geometry_msgs.Twist import Twist  # 导入速度命令消息类型
 from dimos.msgs.geometry_msgs.Vector3 import Vector3  # 导入三维向量类型，用于构造 Twist
 from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo  # 导入相机内参消息类型
@@ -36,7 +38,15 @@ from dimos.utils.logging_config import setup_logger  # 导入日志初始化函�
 
 logger = setup_logger()  # 创建当前文件使用的日志对象
 
-BehaviorState = Literal["idle", "approaching", "done"]  # 定义行为状态机的合法状态
+BehaviorState = Literal[
+    "idle",
+    "approaching",
+    "dwelling_near",
+    "retreating",
+    "standing_off",
+    "returning",
+    "done",
+]  # 定义行为状态机的合法状态
 
 _LINEAR_GAIN = 0.8  # 定义距离误差到线速度的简单比例增益
 _ANGULAR_GAIN = 1.0  # 定义横向像素误差到角速度的简单比例增益
@@ -52,10 +62,16 @@ def _safe_track_id(raw: Any) -> int:  # 安全地把 detection.id 转换为 int�
 
 class BBoxDistanceBehaviorConfig(ModuleConfig):  # 定义 bbox 距离行为模块配置
     command_hz: float = 20.0  # 速度命令发布频率，单位 Hz
-    approach_distance: float = 0.2  # 靠近阶段目标距离，单位米
+    near_distance: float = 0.5  # 靠近/返回阶段目标距离，单位米
+    approach_distance: float | None = None  # 兼容旧配置名；设置后会覆盖 near_distance
+    dwell_duration_sec: float = 10.0  # 到达近距离后原地停留的时间，单位秒
+    standoff_distance: float = 1.5  # 后退和守候阶段要求保持的最小距离，单位米
+    standoff_duration_sec: float = 45.0  # 保持远距离等待的时间，单位秒
     max_linear_speed: float = 0.45  # 最大线速度，单位 m/s
     max_angular_speed: float = 0.8  # 最大角速度，单位 rad/s
-    tf_time_tolerance: float = 0.5  # TF 查询时间容差，单位秒
+    tf_time_tolerance: float = 5.0  # TF 查询时间容差，单位秒；和现有 3D 检测模块保持一致
+    prefer_latest_tf: bool = True  # 优先使用最新 TF，避免 replay/live 时间戳漂移导致动作卡死
+    action_log_interval_sec: float = 1.0  # 动作执行日志最小间隔，避免 command_hz 级别刷屏
 
 
 class BBoxDistanceBehaviorModule(
@@ -66,6 +82,7 @@ class BBoxDistanceBehaviorModule(
     lidar: In[PointCloud2]  # 输入 Go2 lidar 点云
     camera_info: In[CameraInfo]  # 输入 Go2 相机内参
     teleop_active: In[Bool]  # 输入遥控信号；有值时中断当前任务，交回键盘控制
+    lock_status: In[String]  # 输入目标锁/追踪状态；没有发布者的 blueprint 中此流可以为空
     cmd_vel: Out[Twist]  # 输出 Go2 速度命令（有 MovementManager 时连接到 nav_cmd_vel）
     clear_selection_request: Out[Bool]  # 输出 task 完成/停止后的清除请求，防止旧 bbox 重启 task
     behavior_status: Out[String]  # 输出行为状态，便于日志和调试
@@ -83,8 +100,15 @@ class BBoxDistanceBehaviorModule(
         self._latest_selected_bbox: Detection2DArray | None = None  # 保存最新 selected bbox
         self._latest_lidar: PointCloud2 | None = None  # 保存最新 lidar 点云
         self._latest_camera_info: CameraInfo | None = None  # 保存最新 camera_info
-        self._active_approach_distance = self.config.approach_distance  # 保存本次行为使用的靠近距离
+        self._latest_lock_state: str | None = None  # 保存 tracker 最新状态，用于区分搜索和用户清空
+        self._active_near_distance = self._configured_near_distance()  # 保存本次行为使用的近距离
+        self._active_dwell_duration_sec = self.config.dwell_duration_sec  # 保存本次近距离停留时间
+        self._active_standoff_distance = self.config.standoff_distance  # 保存本次守候距离
+        self._active_standoff_duration_sec = self.config.standoff_duration_sec  # 保存本次远距离守候时间
+        self._phase_started_at: float | None = None  # 保存当前计时阶段开始时间
         self._last_block_reason: str | None = None  # 记录上一次阻塞原因，避免重复刷日志
+        self._last_action_log_at = 0.0  # 记录上次动作日志时间，用于节流
+        self._last_action_log_state: BehaviorState | None = None  # 记录上次动作日志状态
         self._planner: ReplanningAStarPlannerSpec | None = (
             None  # 可选规划器引用，由 blueprint 在 build 时注入
         )
@@ -104,6 +128,9 @@ class BBoxDistanceBehaviorModule(
         self.register_disposable(
             Disposable(self.teleop_active.subscribe(self._on_teleop_active))
         )  # 订阅遥控打断信号
+        self.register_disposable(
+            Disposable(self.lock_status.subscribe(self._on_lock_status))
+        )  # 订阅目标锁/追踪状态，没有发布者时不会收到消息
         self._stop_event.clear()  # 清除停止事件，允许后台线程运行
         self._thread = threading.Thread(  # 创建后台命令发布线程
             target=self._command_loop,  # 指定线程执行固定频率控制循环
@@ -113,7 +140,10 @@ class BBoxDistanceBehaviorModule(
         self._thread.start()  # 启动后台命令发布线程
         logger.info(
             "BBoxDistanceBehaviorModule: task loop started "
-            f"command_hz={self.config.command_hz} approach_distance={self.config.approach_distance}"
+            f"command_hz={self.config.command_hz} near_distance={self._configured_near_distance()} "
+            f"dwell_duration_sec={self.config.dwell_duration_sec} "
+            f"standoff_distance={self.config.standoff_distance} "
+            f"standoff_duration_sec={self.config.standoff_duration_sec}"
         )
         self._publish_status("idle")  # 发布初始状态
 
@@ -131,22 +161,38 @@ class BBoxDistanceBehaviorModule(
     def start_bbox_distance_behavior(  # 定义行为启动 RPC
         self,  # 传入模块实例
         approach_distance: float | None = None,  # 可选覆盖靠近阶段目标距离
+        near_distance: float | None = None,  # 可选覆盖近距离；优先级高于旧的 approach_distance
+        dwell_duration_sec: float | None = None,  # 可选覆盖近距离停留时间
+        standoff_distance: float | None = None,  # 可选覆盖后退/守候距离
+        standoff_duration_sec: float | None = None,  # 可选覆盖远距离守候时间
     ) -> str:  # 返回可读启动结果
         with self._lock:  # 加锁重置状态机参数
-            self._active_approach_distance = (
-                self.config.approach_distance
-                if approach_distance is None
-                else float(approach_distance)
-            )  # 设置本次靠近距离
+            self._active_near_distance = self._resolve_active_near_distance(
+                near_distance=near_distance,
+                approach_distance=approach_distance,
+            )  # 设置本次近距离
+            self._active_dwell_duration_sec = self._resolve_duration(
+                dwell_duration_sec, self.config.dwell_duration_sec
+            )  # 设置本次近距离停留时间
+            self._active_standoff_distance = self._resolve_distance(
+                standoff_distance, self.config.standoff_distance
+            )  # 设置本次远距离守候距离
+            self._active_standoff_duration_sec = self._resolve_duration(
+                standoff_duration_sec, self.config.standoff_duration_sec
+            )  # 设置本次远距离守候时间
             self._state = "approaching"  # 进入靠近阶段
+            self._phase_started_at = None  # 靠近阶段无需计时，清空阶段开始时间
 
         logger.info(
             "BBoxDistanceBehaviorModule: task started by RPC "
-            f"approach_distance={self._active_approach_distance}"
+            f"near_distance={self._active_near_distance} "
+            f"dwell_duration_sec={self._active_dwell_duration_sec} "
+            f"standoff_distance={self._active_standoff_distance} "
+            f"standoff_duration_sec={self._active_standoff_duration_sec}"
         )
 
         self._publish_status("approaching")  # 发布状态变化
-        return "bbox distance behavior started"  # 返回启动确认
+        return "bbox distance sequence started"  # 返回启动确认
 
     @rpc  # 标记 stop_bbox_distance_behavior() 可通过 DimOS RPC 调用
     def stop_bbox_distance_behavior(self) -> str:  # 定义行为停止 RPC
@@ -154,6 +200,8 @@ class BBoxDistanceBehaviorModule(
             previous_target_id = self._active_target_id
             self._state = "idle"  # 回到 idle 状态
             self._active_target_id = None  # 清空当前目标 id
+            self._phase_started_at = None  # 清空阶段计时
+            self._reset_action_log()  # 重置动作日志节流状态
 
         self.cmd_vel.publish(Twist.zero())  # 行为停止时发布零速度
         self._request_selection_clear(reason="rpc_stop")  # 清掉旧 bbox，避免下一帧自动重启 task
@@ -169,20 +217,24 @@ class BBoxDistanceBehaviorModule(
             detection = self._extract_single_detection(selected_bbox)  # 读取当前选中目标
             current_target_id = self._active_target_id  # 复制当前目标 id
             current_state = self._state  # 复制当前状态
+            lock_state = self._latest_lock_state  # 复制目标锁/追踪状态
 
         if detection is None:  # 如果当前没有选中目标
-            with self._lock:  # 加锁重置状态
-                previous_target_id = self._active_target_id
-                self._active_target_id = None  # 清空当前目标 id
-                self._state = "idle"  # 回到 idle
+            if self._should_reset_on_empty_selection(lock_state):  # 无 tracker 或明确清空时重置任务
+                with self._lock:  # 加锁重置状态
+                    previous_target_id = self._active_target_id
+                    self._active_target_id = None  # 清空当前目标 id
+                    self._state = "idle"  # 回到 idle
+                    self._phase_started_at = None  # 清空阶段计时
+                    self._reset_action_log()  # 重置动作日志节流状态
 
-            if previous_target_id is not None or current_state != "idle":
-                self.cmd_vel.publish(Twist.zero())  # 从活动任务退出时立即停止一次
-                logger.info(
-                    "BBoxDistanceBehaviorModule: task ended because selection cleared "
-                    f"previous_target_id={previous_target_id!r}"
-                )
-                self._publish_status("idle")  # 发布 idle 状态
+                if previous_target_id is not None or current_state != "idle":
+                    self.cmd_vel.publish(Twist.zero())  # 从活动任务退出时立即停止一次
+                    logger.info(
+                        "BBoxDistanceBehaviorModule: task ended because selection cleared "
+                        f"previous_target_id={previous_target_id!r}"
+                    )
+                    self._publish_status("idle")  # 发布 idle 状态
             return  # 结束处理
 
         target_id = self._detection_id(detection)  # 读取当前目标 id
@@ -195,11 +247,17 @@ class BBoxDistanceBehaviorModule(
             self._publish_status("done")  # 保持完成状态
             return  # 不重新启动任务
 
-        if current_state == "approaching" and current_target_id == target_id:
-            return  # 同一目标持续靠近中，不重复触发 task 启动日志和状态发布
+        if current_state not in ("idle", "done") and current_target_id == target_id:
+            return  # 同一目标的完整序列已经在运行，不被后续 bbox 帧重置阶段计时
 
         with self._lock:  # 加锁切换到靠近状态
+            self._active_near_distance = self._configured_near_distance()  # 新目标使用当前配置近距离
+            self._active_dwell_duration_sec = self.config.dwell_duration_sec  # 新目标使用当前配置停留时间
+            self._active_standoff_distance = self.config.standoff_distance  # 新目标使用当前配置守候距离
+            self._active_standoff_duration_sec = self.config.standoff_duration_sec  # 新目标使用当前配置守候时间
             self._state = "approaching"  # 新目标或尚未完成时自动进入靠近阶段
+            self._phase_started_at = None  # 靠近阶段无需计时
+            self._reset_action_log()  # 新序列重新打印第一条动作日志
 
         if self._planner is not None:  # 如果存在 A* 规划器，取消当前导航，避免与 bbox 追踪指令竞争
             self._planner.cancel_goal()
@@ -210,6 +268,34 @@ class BBoxDistanceBehaviorModule(
         )
 
         self._publish_status("approaching")  # 发布自动启动状态
+
+    def _on_lock_status(self, msg: String) -> None:  # 处理目标锁/追踪状态消息
+        try:  # 尝试解析 tracker 发布的 JSON 状态
+            payload = json.loads(str(getattr(msg, "data", "")))  # 从 LCM String 中读取 data 字段
+        except json.JSONDecodeError:  # 如果消息不是合法 JSON
+            logger.info("BBoxDistanceBehaviorModule: ignoring malformed lock_status")
+            return  # 不改变任务状态
+
+        lock_state = str(payload.get("state", ""))  # 读取 tracker 状态名
+        with self._lock:  # 加锁更新状态缓存
+            self._latest_lock_state = lock_state  # 保存最新 tracker 状态
+            current_state = self._state  # 复制当前行为状态
+            previous_target_id = self._active_target_id  # 复制当前目标 id
+
+            if lock_state not in ("unselected", "lost") or current_state == "idle":
+                return  # locked/searching 不重置任务；idle 也无需重复处理
+
+            self._state = "idle"  # tracker 明确无目标或丢失时停止任务
+            self._active_target_id = None  # 清空目标 id
+            self._phase_started_at = None  # 清空阶段计时
+            self._reset_action_log()  # 重置动作日志节流状态
+
+        self.cmd_vel.publish(Twist.zero())  # 目标明确丢失时立即停车
+        logger.info(
+            "BBoxDistanceBehaviorModule: task ended because target tracker is inactive "
+            f"lock_state={lock_state!r} previous_target_id={previous_target_id!r}"
+        )
+        self._publish_status("idle")  # 发布 idle 状态
 
     def _on_lidar(self, lidar: PointCloud2) -> None:  # 处理新的 lidar 点云
         with self._lock:  # 加锁更新缓存
@@ -229,6 +315,8 @@ class BBoxDistanceBehaviorModule(
                 return
             self._state = "idle"  # 回到 idle
             self._active_target_id = None  # 清空目标
+            self._phase_started_at = None  # 清空阶段计时
+            self._reset_action_log()  # 重置动作日志节流状态
         self.cmd_vel.publish(Twist.zero())  # 立即停止
         self._request_selection_clear(
             reason="interrupt"
@@ -254,7 +342,11 @@ class BBoxDistanceBehaviorModule(
             selected_bbox = self._latest_selected_bbox  # 复制 latest selected bbox
             lidar = self._latest_lidar  # 复制 latest lidar
             camera_info = self._latest_camera_info  # 复制 latest camera_info
-            approach_distance = self._active_approach_distance  # 复制本次靠近距离
+            near_distance = self._active_near_distance  # 复制本次近距离
+            dwell_duration_sec = self._active_dwell_duration_sec  # 复制本次近距离停留时间
+            standoff_distance = self._active_standoff_distance  # 复制本次远距离守候距离
+            standoff_duration_sec = self._active_standoff_duration_sec  # 复制本次远距离守候时间
+            phase_started_at = self._phase_started_at  # 复制当前阶段开始时间
 
         if state == "idle":  # 如果行为未启动
             self._set_block_reason(None)
@@ -290,35 +382,195 @@ class BBoxDistanceBehaviorModule(
         self._set_block_reason(None)
 
         bbox_center_x = float(detection.bbox.center.position.x)  # 读取 bbox 中心 x 像素坐标
-        target_distance = approach_distance  # 始终靠近到目标距离
-        twist = self._make_twist(
-            distance, target_distance, bbox_center_x, camera_info
-        )  # 生成线速度和角速度命令
+        now = time.monotonic()  # 读取当前单调时间，用于阶段计时
 
-        if (
-            state == "approaching" and distance <= approach_distance + _DISTANCE_TOLERANCE_M
-        ):  # 如果已经到达靠近目标距离
-            completed_target_id = self._detection_id(detection)
-            with self._lock:  # 加锁切换完成状态
-                self._state = "done"  # 标记行为完成
-                self._active_target_id = (
-                    completed_target_id  # 记录完成的目标，避免同一目标被重复自动重启
+        if state == "approaching":  # 第一阶段：靠近目标直到 near_distance
+            if distance <= near_distance + _DISTANCE_TOLERANCE_M:  # 到达近距离阈值
+                self._transition_to("dwelling_near", now, distance=distance)  # 进入近距离停留阶段
+                return Twist.zero()  # 到达瞬间先停车
+            twist = self._make_twist(
+                distance, near_distance, bbox_center_x, camera_info
+            )  # 目标仍较远时继续靠近
+            self._log_action(
+                state, now, distance, near_distance, phase_started_at, twist
+            )  # 打印靠近动作日志
+            return twist
+
+        if state == "dwelling_near":  # 第二阶段：原地停留 dwell_duration_sec
+            if self._phase_elapsed(now, phase_started_at) >= dwell_duration_sec:  # 停留时间已满
+                self._transition_to("retreating", now, distance=distance)  # 进入后退阶段
+            else:
+                self._log_action(
+                    state, now, distance, near_distance, phase_started_at, Twist.zero()
+                )  # 打印近距离停留日志
+            return Twist.zero()  # dwell 阶段保持原地停止
+
+        if state == "retreating":  # 第三阶段：后退到至少 standoff_distance
+            if distance >= standoff_distance:  # 已经满足最小远距离
+                self._transition_to("standing_off", now, distance=distance)  # 进入远距离守候阶段
+                return Twist.zero()  # 切换阶段时先停车
+            twist = self._make_standoff_twist(
+                distance, standoff_distance, bbox_center_x, camera_info
+            )  # 目标仍太近时继续后退
+            self._log_action(
+                state, now, distance, standoff_distance, phase_started_at, twist
+            )  # 打印后退动作日志
+            return twist
+
+        if state == "standing_off":  # 第四阶段：保持至少 standoff_distance 并等待
+            if self._phase_elapsed(now, phase_started_at) >= standoff_duration_sec:  # 守候时间已满
+                self._transition_to("returning", now, distance=distance)  # 进入返回目标阶段
+                return Twist.zero()  # 切换阶段时先停车
+            if distance < standoff_distance:  # 守候期间目标靠近，必须主动后退
+                twist = self._make_standoff_twist(
+                    distance, standoff_distance, bbox_center_x, camera_info
+                )  # 发布只允许后退的守距速度
+                self._log_action(
+                    state, now, distance, standoff_distance, phase_started_at, twist
+                )  # 打印守距后退日志
+                return twist
+            self._log_action(
+                state, now, distance, standoff_distance, phase_started_at, Twist.zero()
+            )  # 打印远距离等待日志
+            return Twist.zero()  # 距离满足要求时保持原地等待
+
+        if state == "returning":  # 第五阶段：返回目标身边
+            if distance <= near_distance + _DISTANCE_TOLERANCE_M:  # 已回到近距离阈值
+                completed_target_id = self._detection_id(detection)  # 记录完成目标 id
+                with self._lock:  # 加锁切换完成状态
+                    self._state = "done"  # 标记行为完成
+                    self._active_target_id = completed_target_id  # 保存完成目标 id，避免旧 bbox 重启
+                    self._phase_started_at = None  # 完成态无需计时
+                    self._reset_action_log()  # 完成后重置动作日志节流状态
+                logger.info(
+                    "BBoxDistanceBehaviorModule: sequence completed "
+                    f"target_id={completed_target_id!r} distance={distance:.3f}"
                 )
-            logger.info(
-                "BBoxDistanceBehaviorModule: task completed "
-                f"target_id={completed_target_id!r} distance={distance:.3f}"
-            )
-            self._publish_status("done", distance=distance)  # 发布完成状态
-            self._request_selection_clear(
-                reason="completed"
-            )  # 完成后回到等待用户输入，不继续消费旧 bbox
-            return Twist.zero()  # 完成时发布零速度
+                self._publish_status("done", distance=distance)  # 发布完成状态
+                self._request_selection_clear(
+                    reason="completed"
+                )  # 完整序列结束后清除选择，回到等待用户输入
+                return Twist.zero()  # 完成时发布零速度
+            twist = self._make_twist(
+                distance, near_distance, bbox_center_x, camera_info
+            )  # 目标仍较远时靠近返回
+            self._log_action(
+                state, now, distance, near_distance, phase_started_at, twist
+            )  # 打印返回动作日志
+            return twist
 
-        return twist  # 返回当前控制周期的速度命令
+        return Twist.zero()  # 未识别状态保守停车
 
     def _request_selection_clear(self, reason: str) -> None:
         self.clear_selection_request.publish(Bool(data=True))
         logger.info(f"BBoxDistanceBehaviorModule: requested selection clear reason={reason}")
+
+    def _reset_action_log(self) -> None:  # 重置动作日志节流状态
+        self._last_action_log_at = 0.0  # 下一次动作循环会立即打印
+        self._last_action_log_state = None  # 清空上一次状态，确保新阶段首条日志可见
+
+    def _configured_near_distance(self) -> float:  # 读取配置中的近距离，兼容旧 approach_distance 字段
+        if self.config.approach_distance is not None:  # 如果旧配置名被显式设置
+            return self._resolve_distance(
+                self.config.approach_distance, self.config.near_distance
+            )  # 旧配置优先，保证旧 blueprint 行为可控
+        return self._resolve_distance(
+            self.config.near_distance, 0.5
+        )  # 否则使用新的 near_distance 默认值
+
+    def _resolve_active_near_distance(
+        self,
+        *,
+        near_distance: float | None,
+        approach_distance: float | None,
+    ) -> float:  # 解析 RPC 覆盖参数中的近距离
+        if near_distance is not None:  # 新参数优先
+            return self._resolve_distance(near_distance, self._configured_near_distance())
+        if approach_distance is not None:  # 旧参数作为兼容别名
+            return self._resolve_distance(approach_distance, self._configured_near_distance())
+        return self._configured_near_distance()  # 没有覆盖时使用配置值
+
+    @staticmethod  # 声明这是不依赖实例状态的工具函数
+    def _resolve_distance(value: float | None, default: float) -> float:  # 校验并解析距离参数
+        resolved = default if value is None else float(value)  # 使用覆盖值或默认值
+        if not math.isfinite(resolved) or resolved <= 0.0:  # 距离必须是正有限数
+            raise ValueError(f"distance must be positive and finite, got {resolved!r}")
+        return resolved  # 返回合法距离
+
+    @staticmethod  # 声明这是不依赖实例状态的工具函数
+    def _resolve_duration(value: float | None, default: float) -> float:  # 校验并解析时间参数
+        resolved = default if value is None else float(value)  # 使用覆盖值或默认值
+        if not math.isfinite(resolved) or resolved < 0.0:  # 时长必须是非负有限数
+            raise ValueError(f"duration must be non-negative and finite, got {resolved!r}")
+        return resolved  # 返回合法时长
+
+    @staticmethod  # 声明这是不依赖实例状态的工具函数
+    def _phase_elapsed(now: float, phase_started_at: float | None) -> float:  # 计算当前阶段已用时间
+        if phase_started_at is None:  # 如果阶段尚未记录开始时间
+            return 0.0  # 返回 0，避免误跳阶段
+        return max(0.0, now - phase_started_at)  # 返回非负 elapsed 秒数
+
+    @staticmethod  # 声明这是不依赖实例状态的工具函数
+    def _should_reset_on_empty_selection(lock_state: str | None) -> bool:  # 判断空 bbox 是否代表清空目标
+        return lock_state in (None, "unselected", "lost")  # searching 时保留任务等待 tracker 重找
+
+    def _transition_to(
+        self, state: BehaviorState, now: float, **fields: float
+    ) -> None:  # 切换状态并记录阶段开始时间
+        with self._lock:  # 加锁更新状态机
+            old_state = self._state  # 记录旧状态，便于日志
+            self._state = state  # 设置新状态
+            self._phase_started_at = now  # 记录新阶段开始时间
+            self._reset_action_log()  # 新阶段第一条控制命令要打印日志
+        logger.info(f"BBoxDistanceBehaviorModule: state {old_state} -> {state}")
+        self._publish_status(state, **fields)  # 发布状态变化
+
+    def _log_action(
+        self,
+        state: BehaviorState,
+        now: float,
+        distance: float,
+        target_distance: float,
+        phase_started_at: float | None,
+        twist: Twist,
+    ) -> None:  # 按阶段节流打印正在执行的动作
+        interval_sec = max(float(self.config.action_log_interval_sec), 0.0)  # 读取日志节流间隔
+        if (
+            self._last_action_log_state == state
+            and interval_sec > 0.0
+            and now - self._last_action_log_at < interval_sec
+        ):  # 同一阶段且还没到日志间隔
+            return  # 跳过本周期日志，避免 20Hz 刷屏
+
+        with self._lock:  # 加锁读取当前目标 id
+            target_id = self._active_target_id  # 复制目标 id
+
+        elapsed_sec = self._phase_elapsed(now, phase_started_at)  # 计算当前阶段已执行时间
+        logger.info(
+            "BBoxDistanceBehaviorModule: action "
+            f"state={state} target_id={target_id!r} "
+            f"distance={distance:.3f} target_distance={target_distance:.3f} "
+            f"elapsed_sec={elapsed_sec:.1f} "
+            f"linear_x={float(twist.linear.x):.3f} angular_z={float(twist.angular.z):.3f}"
+        )  # 输出当前动作、距离和速度，便于现场判断是否在靠近/后退/等待
+        self._last_action_log_at = now  # 更新上次日志时间
+        self._last_action_log_state = state  # 更新上次日志状态
+
+    def _make_standoff_twist(  # 定义守距阶段速度，只允许后退，不允许主动靠近
+        self,
+        distance: float,
+        standoff_distance: float,
+        bbox_center_x: float,
+        camera_info: CameraInfo,
+    ) -> Twist:
+        twist = self._make_twist(
+            distance, standoff_distance, bbox_center_x, camera_info
+        )  # 复用距离控制和转向控制
+        linear_x = min(float(twist.linear.x), 0.0)  # 守距时线速度只允许为负或零，避免主动前进
+        return Twist(
+            linear=Vector3(linear_x, 0.0, 0.0),
+            angular=twist.angular,
+        )  # 返回守距速度命令
 
     def _make_twist(  # 定义根据距离和 bbox 横向位置生成 Twist 的函数
         self,  # 传入模块实例
@@ -365,8 +617,8 @@ class BBoxDistanceBehaviorModule(
         )
         # 2. 从 TF 获取 world→camera_optical 变换
         ts = float(lidar.ts or 0.0)  # 用 lidar 时间戳对齐 TF
-        world_to_optical = self.tf.get(
-            "camera_optical", lidar.frame_id, ts, time_tolerance=self.config.tf_time_tolerance
+        world_to_optical = self._lookup_transform(
+            "camera_optical", lidar.frame_id, ts
         )  # 查询 world→camera_optical 变换
         if world_to_optical is None:  # 如果 TF 暂时不可用
             return None  # 等待下一帧
@@ -400,6 +652,34 @@ class BBoxDistanceBehaviorModule(
         return (
             distance if math.isfinite(distance) and distance > 0.0 else None
         )  # 只接受有限且正的距离
+
+    def _lookup_transform(
+        self, parent_frame: str, child_frame: str, ts: float
+    ) -> Transform | None:  # 查询 TF；时间戳查不到时回退到最新 TF
+        if self.config.prefer_latest_tf:  # custom 行为默认更重视实时控制可用性
+            return self.tf.get(
+                parent_frame,
+                child_frame,
+                time_tolerance=self.config.tf_time_tolerance,
+            )  # 使用最新 TF，避免 replay/live 时间戳漂移触发持续 no_3d_detection
+
+        transform = self.tf.get(
+            parent_frame,
+            child_frame,
+            ts,
+            time_tolerance=self.config.tf_time_tolerance,
+        )  # 优先使用和 lidar 时间戳对齐的 TF
+        if transform is not None:  # 如果按时间戳查到了
+            return transform  # 返回精确时间附近的 TF
+
+        if ts <= 0.0:  # 如果传入时间戳本身不可用
+            return None  # 不做 latest fallback，保持失败语义清晰
+
+        return self.tf.get(
+            parent_frame,
+            child_frame,
+            time_tolerance=self.config.tf_time_tolerance,
+        )  # replay/live 时间戳漂移时，回退到最新 TF，避免任务永久卡在 no_3d_detection
 
     def _set_block_reason(self, reason: str | None) -> None:
         if reason == self._last_block_reason:

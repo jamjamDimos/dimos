@@ -4,13 +4,19 @@ from pathlib import Path
 from typing import Any
 
 from dimos.core.coordination.blueprints import autoconnect  # 导入蓝图组合函数
-from dimos.core.coordination.module_coordinator import ModuleCoordinator  # 导入直接运行蓝图所需协调器
+from dimos.core.coordination.module_coordinator import (
+    ModuleCoordinator,  # 导入直接运行蓝图所需协调器
+)
 from dimos.core.global_config import global_config  # 导入全局配置，用于复用 viewer backend 选择
 from dimos.core.transport import LCMTransport  # 导入 LCM transport，用于固定 topic 名称
 from dimos.msgs.vision_msgs.Detection2DArray import Detection2DArray  # 导入 2D 检测数组消息类型
 from dimos.perception.detection.module2D import Detection2DModule  # 导入多 bbox 检测模块
-from dimos.robot.custom.tasks.bbox_distance_behavior_module import BBoxDistanceBehaviorModule  # 导入距离任务模块
-from dimos.robot.custom.modules.bbox_selection_module import BBoxSelectionModule  # 导入 bbox 选择模块
+from dimos.robot.custom.modules.bbox_selection_module import (
+    BBoxSelectionModule,  # 导入 bbox 选择模块
+)
+from dimos.robot.custom.tasks.bbox_distance_behavior_module import (
+    BBoxDistanceBehaviorModule,  # 导入距离任务模块
+)
 from dimos.robot.custom.visualization.detection2d_overlay import (
     detections_overlay,  # 黄色候选 bbox overlay
     selected_bbox_overlay,  # 绿色 selected bbox overlay
@@ -19,7 +25,9 @@ from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import (
     rerun_config as go2_rerun_config,  # 导入 Go2 默认 rerun 配置，用于局部扩展
     unitree_go2_basic,  # 导入 Go2 基础蓝图
 )
-from dimos.robot.unitree.go2.connection import GO2Connection  # 导入 Go2 连接类，复用静态 camera_info
+from dimos.robot.unitree.go2.connection import (
+    GO2Connection,  # 导入 Go2 连接类，复用静态 camera_info
+)
 from dimos.utils.data import get_data_dir  # 导入数据目录解析函数，用于定位本地模型文件
 from dimos.visualization.vis_module import vis_module  # 导入 viewer 模块工厂
 
@@ -100,7 +108,7 @@ bbox_distance_follow = autoconnect(  # 定义 CLI 可运行的 bbox-distance-fol
         publish_detection_images=False,  # 关闭 cropped detected_image，避免 3D view 无 Pinhole 警告
     ),
     BBoxSelectionModule.blueprint(),  # 从多 bbox 中选择单个 bbox
-    BBoxDistanceBehaviorModule.blueprint(approach_distance=0.2),  # 点选后自动靠近到 0.2m 并结束
+    BBoxDistanceBehaviorModule.blueprint(near_distance=0.5),  # 点选后执行靠近/停留/后退/守候/返回序列
 ).global_config(
     n_workers=6,  # 给 Go2、viewer、detector、selection 和 behavior 留足 worker
     robot_model="unitree_go2",

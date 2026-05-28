@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 from typing import Any
 
-from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
+from dimos_lcm.std_msgs import Bool, String  # type: ignore[import-untyped]
 from dimos_lcm.vision_msgs import (
     BoundingBox2D,
     Detection2D,
@@ -120,6 +121,10 @@ def _subscribe_clear_requests(module: BBoxDistanceBehaviorModule) -> list[Any]:
     return received
 
 
+def _lock_status(state: str) -> String:
+    return String(data=json.dumps({"state": state}))
+
+
 def test_selected_bbox_auto_starts_approach(module: BBoxDistanceBehaviorModule) -> None:
     status = _subscribe_status(module)
     module._on_lidar(PointCloud2())
@@ -131,7 +136,7 @@ def test_selected_bbox_auto_starts_approach(module: BBoxDistanceBehaviorModule) 
     assert status
 
 
-def test_selected_bbox_reaches_point_two_and_finishes(
+def test_selected_bbox_reaches_near_distance_and_enters_dwell(
     module: BBoxDistanceBehaviorModule,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,7 +145,7 @@ def test_selected_bbox_reaches_point_two_and_finishes(
     module._on_camera_info(CameraInfo.from_intrinsics(100.0, 100.0, 50.0, 50.0, 100, 100))
     module._on_selected_bbox(_make_array(_make_detection("target", 40.0, 40.0, 60.0, 60.0)))
 
-    distances = [0.30, 0.24]
+    distances = [0.80, 0.54]
 
     monkeypatch.setattr(
         module,
@@ -152,6 +157,111 @@ def test_selected_bbox_reaches_point_two_and_finishes(
 
     assert twist is not None
     assert twist.linear.x > 0.0
+    dwell_twist = module._compute_next_twist()
+    assert dwell_twist is not None
+    assert dwell_twist.linear.x == 0.0
+    assert dwell_twist.angular.z == 0.0
+    assert module._state == "dwelling_near"
+    assert not clear_requests
+
+
+def test_same_target_frames_do_not_restart_active_sequence(
+    module: BBoxDistanceBehaviorModule,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = {"value": 100.0}
+
+    def _monotonic() -> float:
+        return now["value"]
+
+    monkeypatch.setattr(
+        "dimos.robot.custom.tasks.bbox_distance_behavior_module.time.monotonic",
+        _monotonic,
+    )
+    monkeypatch.setattr(module, "_estimate_3d_distance", lambda *args, **kwargs: 0.54)
+
+    selected = _make_array(_make_detection("target", 40.0, 40.0, 60.0, 60.0))
+    module._on_lidar(PointCloud2())
+    module._on_camera_info(CameraInfo.from_intrinsics(100.0, 100.0, 50.0, 50.0, 100, 100))
+    module._on_selected_bbox(selected)
+    module._compute_next_twist()
+    phase_started_at = module._phase_started_at
+
+    now["value"] = 105.0
+    module._on_selected_bbox(selected)
+
+    assert module._state == "dwelling_near"
+    assert module._phase_started_at == phase_started_at
+
+
+def test_full_distance_sequence_returns_and_clears_selection(
+    module: BBoxDistanceBehaviorModule,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = {"value": 100.0}
+
+    def _monotonic() -> float:
+        return now["value"]
+
+    monkeypatch.setattr(
+        "dimos.robot.custom.tasks.bbox_distance_behavior_module.time.monotonic",
+        _monotonic,
+    )
+    distances = iter([0.54, 0.54, 0.54, 1.00, 1.50, 1.60, 1.20, 1.60, 0.80, 0.54])
+    monkeypatch.setattr(module, "_estimate_3d_distance", lambda *args, **kwargs: next(distances))
+
+    clear_requests = _subscribe_clear_requests(module)
+    module._on_lidar(PointCloud2())
+    module._on_camera_info(CameraInfo.from_intrinsics(100.0, 100.0, 50.0, 50.0, 100, 100))
+    module._on_selected_bbox(_make_array(_make_detection("target", 40.0, 40.0, 60.0, 60.0)))
+
+    near_twist = module._compute_next_twist()
+    assert near_twist is not None
+    assert near_twist.linear.x == 0.0
+    assert module._state == "dwelling_near"
+
+    now["value"] = 109.0
+    dwell_twist = module._compute_next_twist()
+    assert dwell_twist is not None
+    assert dwell_twist.linear.x == 0.0
+    assert module._state == "dwelling_near"
+
+    now["value"] = 111.0
+    retreat_start_twist = module._compute_next_twist()
+    assert retreat_start_twist is not None
+    assert retreat_start_twist.linear.x == 0.0
+    assert module._state == "retreating"
+
+    retreat_twist = module._compute_next_twist()
+    assert retreat_twist is not None
+    assert retreat_twist.linear.x < 0.0
+
+    standoff_start_twist = module._compute_next_twist()
+    assert standoff_start_twist is not None
+    assert standoff_start_twist.linear.x == 0.0
+    assert module._state == "standing_off"
+
+    now["value"] = 120.0
+    hold_twist = module._compute_next_twist()
+    assert hold_twist is not None
+    assert hold_twist.linear.x == 0.0
+    assert module._state == "standing_off"
+
+    guard_twist = module._compute_next_twist()
+    assert guard_twist is not None
+    assert guard_twist.linear.x < 0.0
+    assert module._state == "standing_off"
+
+    now["value"] = 157.0
+    return_start_twist = module._compute_next_twist()
+    assert return_start_twist is not None
+    assert return_start_twist.linear.x == 0.0
+    assert module._state == "returning"
+
+    return_twist = module._compute_next_twist()
+    assert return_twist is not None
+    assert return_twist.linear.x > 0.0
+
     done_twist = module._compute_next_twist()
     assert done_twist is not None
     assert done_twist.linear.x == 0.0
@@ -169,6 +279,22 @@ def test_empty_selected_bbox_resets_to_idle(module: BBoxDistanceBehaviorModule) 
 
     assert module._state == "idle"
     assert cmd_published and cmd_published[-1].linear.x == 0.0
+
+
+def test_empty_locked_bbox_during_searching_keeps_active_sequence(
+    module: BBoxDistanceBehaviorModule,
+) -> None:
+    module._on_selected_bbox(_make_array(_make_detection("target", 40.0, 40.0, 60.0, 60.0)))
+    assert module._state == "approaching"
+
+    module._on_lock_status(_lock_status("searching"))
+    module._on_selected_bbox(_make_array())
+
+    assert module._state == "approaching"
+
+    module._on_lock_status(_lock_status("unselected"))
+
+    assert module._state == "idle"
 
 
 def test_empty_selected_bbox_while_idle_stays_silent(

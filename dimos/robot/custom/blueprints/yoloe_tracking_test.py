@@ -3,7 +3,9 @@ from __future__ import annotations  # 允许类型注解延迟解析，减少循
 from typing import Any
 
 from dimos.core.coordination.blueprints import autoconnect  # 导入蓝图组合函数
-from dimos.core.coordination.module_coordinator import ModuleCoordinator  # 导入直接运行蓝图所需协调器
+from dimos.core.coordination.module_coordinator import (
+    ModuleCoordinator,  # 导入直接运行蓝图所需协调器
+)
 from dimos.core.global_config import global_config  # 导入全局配置，用于复用 viewer backend 选择
 from dimos.core.transport import LCMTransport  # 导入 LCM transport，用于固定 topic 名称
 from dimos.msgs.vision_msgs.Detection2DArray import Detection2DArray  # 导入 2D 检测数组消息类型
@@ -11,7 +13,9 @@ from dimos.robot.custom.modules.yoloe_tracking_module import (
     YoloeTrackingModule,  # 导入 YOLOE tracking 模块
     _require_yoloe_lrpc_model,  # 导入模型文件预检查函数
 )
-from dimos.robot.custom.visualization.detection2d_overlay import yoloe_overlay  # 导入青色 YOLOE overlay
+from dimos.robot.custom.visualization.detection2d_overlay import (
+    yoloe_overlay,  # 导入青色 YOLOE overlay
+)
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import (
     rerun_config as go2_rerun_config,  # 导入 Go2 默认 rerun 配置，用于局部扩展
     unitree_go2_basic,  # 导入 Go2 基础蓝图

@@ -208,6 +208,7 @@ all_modules = {
     "rerun-bridge-module": "dimos.visualization.rerun.bridge.RerunBridgeModule",
     "rerun-web-socket-server": "dimos.visualization.rerun.websocket_server.RerunWebSocketServer",
     "security-module": "dimos.experimental.security_demo.security_module.SecurityModule",
+    "selected-b-box-csrt-tracker-module": "dimos.robot.custom.modules.selected_bbox_csrt_tracker_module.SelectedBBoxCsrtTrackerModule",
     "semantic-search": "dimos.memory2.module.SemanticSearch",
     "simple-phone-teleop": "dimos.teleop.phone.phone_extensions.SimplePhoneTeleop",
     "simple-planner": "dimos.navigation.nav_stack.modules.simple_planner.simple_planner.SimplePlanner",
